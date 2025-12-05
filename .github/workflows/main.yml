@@ -1,9 +1,7 @@
 name: Gemini Workers
 
 on:
-  workflow_dispatch: {}   # manual start
-  # schedule:
-  #   - cron: "0 * * * *"  # kalau mau jalan tiap jam
+  workflow_dispatch: {}
 
 jobs:
   gemini_worker:
