@@ -33,4 +33,4 @@ jobs:
 
       - name: Jalankan worker Gemini
         run: |
-          python worker_gemini.py
+          python run.py
