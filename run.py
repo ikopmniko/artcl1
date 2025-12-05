@@ -3,7 +3,6 @@ import re
 import unicodedata
 import time
 import json
-import threading
 import requests
 from google import genai  # SDK baru: google-genai
 
@@ -11,11 +10,10 @@ from google import genai  # SDK baru: google-genai
 # ============================
 # KONFIG
 # ============================
-API_FILE = "api.txt"  # semua API key di sini
-JOBS_API_URL = "https://domainmu.com/jobs_api.php"  # GANTI ke URL jobs_api.php kamu
+API_FILE = "api.txt"  # berisi banyak API key (1 baris 1 key)
+JOBS_API_URL = "https://leamarie-yoga.de/jobs_api.php"  # GANTI ke URL jobs_api.php kamu
 
-APIS_PER_JOB = 5                  # 1 job pakai 5 API key = 5 thread
-MIN_SECONDS_PER_REQUEST = 30      # delay per request per thread
+MIN_SECONDS_PER_REQUEST = 8
 MAX_RETRIES_PER_TITLE = 3
 DEFAULT_QUOTA_SLEEP_SECONDS = 60
 
@@ -92,47 +90,38 @@ Now write the best possible article for this title:
 
 
 # ============================
-# LOAD SEMUA API KEY
+# LOAD API KEY DARI api.txt + WORKER_INDEX
 # ============================
 if not os.path.exists(API_FILE):
     raise FileNotFoundError(f"File {API_FILE} tidak ditemukan.")
 
 with open(API_FILE, "r", encoding="utf-8") as f:
-    all_api_keys = [line.strip() for line in f if line.strip()]
+    api_keys = [line.strip() for line in f if line.strip()]
 
-if not all_api_keys:
+if not api_keys:
     raise ValueError("File api.txt kosong atau tidak berisi API key yang valid.")
 
-# GROUP_INDEX dari matrix GitHub Actions (0,1,2,...)
-group_index_str = os.getenv("GROUP_INDEX", "0")
+# WORKER_INDEX dikirim dari GitHub Actions matrix (0, 1, 2, ...)
+worker_index_str = os.getenv("WORKER_INDEX", "0")
 try:
-    GROUP_INDEX = int(group_index_str)
+    WORKER_INDEX = int(worker_index_str)
 except ValueError:
-    raise ValueError(f"GROUP_INDEX bukan integer valid: {group_index_str}")
+    raise ValueError(f"WORKER_INDEX bukan integer valid: {worker_index_str}")
 
-start_idx = GROUP_INDEX * APIS_PER_JOB
-end_idx = start_idx + APIS_PER_JOB
-
-if start_idx >= len(all_api_keys):
+if WORKER_INDEX < 0 or WORKER_INDEX >= len(api_keys):
     raise IndexError(
-        f"GROUP_INDEX={GROUP_INDEX} terlalu besar. "
-        f"start_idx={start_idx}, jumlah API key={len(all_api_keys)}"
+        f"WORKER_INDEX={WORKER_INDEX} di luar range. "
+        f"Jumlah API key: {len(api_keys)}"
     )
 
-api_keys_for_job = all_api_keys[start_idx:end_idx]
-print(f"👷 GROUP_INDEX={GROUP_INDEX}, pakai API index {start_idx}..{end_idx - 1}")
-print(f"🔑 Total API di job ini: {len(api_keys_for_job)}")
+API_KEY = api_keys[WORKER_INDEX]
+print(f"🔑 Worker index {WORKER_INDEX} pakai API key prefix: {API_KEY[:8]}...")
+
+client = genai.Client(api_key=API_KEY)
 
 
 # ============================
-# GLOBAL COUNTER
-# ============================
-global_counter_lock = threading.Lock()
-global_article_counter = 0
-
-
-# ============================
-# FUNGSI: AMBIL JOB
+# AMBIL JOB DARI SERVER
 # ============================
 def get_next_job():
     try:
@@ -151,7 +140,7 @@ def get_next_job():
 
 
 # ============================
-# FUNGSI: KIRIM HASIL
+# KIRIM HASIL KE SERVER
 # ============================
 def submit_result(job_id, status, judul=None, slug=None, metadesc=None, artikel=None):
     payload = {"job_id": job_id, "status": status}
@@ -178,36 +167,31 @@ def submit_result(job_id, status, judul=None, slug=None, metadesc=None, artikel=
 
 
 # ============================
-# WORKER THREAD
+# MAIN LOOP
 # ============================
-def worker_thread(worker_id: int, api_key: str):
-    global global_article_counter
-
-    print(f"[T{worker_id}] Start dengan API prefix {api_key[:8]}...")
-    client = genai.Client(api_key=api_key)
+def main():
     last_call = 0.0
-    local_done = 0
+    total_sukses = 0
 
     while True:
         job = get_next_job()
         if not job:
-            print(f"[T{worker_id}] Tidak ada job lagi, stop.")
+            print("\n🎉 Tidak ada job lagi. Worker berhenti.")
             break
 
         job_id = job["id"]
         judul = job["keyword"]
-        print(f"\n[T{worker_id}][JOB {job_id}] 🎯 Judul: {judul}")
+        print(f"\n[JOB {job_id}] 🎯 Judul: {judul}")
 
         success = False
 
         for attempt in range(1, MAX_RETRIES_PER_TITLE + 1):
             try:
-                # throttle per thread / per key
                 elapsed = time.time() - last_call
                 if elapsed < MIN_SECONDS_PER_REQUEST:
                     time.sleep(MIN_SECONDS_PER_REQUEST - elapsed)
 
-                print(f"[T{worker_id}][JOB {job_id}] 🔄 Gemini attempt {attempt}")
+                print(f"[JOB {job_id}] 🔄 Gemini request (attempt {attempt})")
 
                 prompt = build_prompt(judul)
                 res = client.models.generate_content(
@@ -218,7 +202,7 @@ def worker_thread(worker_id: int, api_key: str):
 
                 raw = (res.text or "").strip()
                 if not raw:
-                    print(f"[T{worker_id}][JOB {job_id}] ⚠ Output kosong.")
+                    print(f"[JOB {job_id}] ⚠ Output kosong dari Gemini.")
                     break
 
                 # META_DESC parsing
@@ -227,14 +211,14 @@ def worker_thread(worker_id: int, api_key: str):
                     metadesc = m.group(1).strip()
                     artikel_html = raw[: m.start()].strip()
                 else:
-                    print(f"[T{worker_id}][JOB {job_id}] ⚠ META_DESC tidak ada, generate manual.")
+                    print(f"[JOB {job_id}] ⚠ META_DESC tidak ditemukan, generate dari artikel.")
                     artikel_html = raw
                     txt = re.sub(r"<.*?>", " ", artikel_html)
                     txt = re.sub(r"\s+", " ", txt).strip()
                     metadesc = txt[:155]
 
                 if not artikel_html:
-                    print(f"[T{worker_id}][JOB {job_id}] ⚠ Artikel kosong setelah parsing.")
+                    print(f"[JOB {job_id}] ⚠ Artikel kosong setelah parsing.")
                     break
 
                 slug = slugify(judul)
@@ -248,74 +232,31 @@ def worker_thread(worker_id: int, api_key: str):
                     artikel=artikel_html,
                 )
 
-                local_done += 1
-                with global_counter_lock:
-                    global_article_counter += 1
-                    total_now = global_article_counter
-
-                print(
-                    f"[T{worker_id}][JOB {job_id}] ✅ DONE. "
-                    f"Local: {local_done}, Global: {total_now}"
-                )
+                total_sukses += 1
+                print(f"[JOB {job_id}] ✅ DONE. Total sukses: {total_sukses}")
                 success = True
                 break
 
             except Exception as e:
                 err_str = str(e)
                 low = err_str.lower()
-                print(f"[T{worker_id}][JOB {job_id}] ❌ Error Gemini: {err_str}")
+                print(f"[JOB {job_id}] ❌ Error Gemini: {err_str}")
 
                 if "quota" in low or "limit" in low or "exceeded" in low:
                     delay = parse_retry_delay_seconds(err_str)
-                    print(
-                        f"[T{worker_id}][JOB {job_id}] 🚫 Quota/limit → tidur {delay:.1f}s"
-                    )
+                    print(f"[JOB {job_id}] 🚫 Quota/limit → tidur {delay:.1f}s lalu coba lagi.")
                     time.sleep(delay)
                     continue
 
-                print(
-                    f"[T{worker_id}][JOB {job_id}] ⚠ Error lain → sleep 10 detik lalu retry."
-                )
+                print(f"[JOB {job_id}] ⚠ Error lain → sleep 10 detik lalu retry.")
                 time.sleep(10)
 
         if not success:
-            print(f"[T{worker_id}][JOB {job_id}] ❌ Gagal permanen, tandai failed.")
+            print(f"[JOB {job_id}] ❌ Gagal permanen setelah {MAX_RETRIES_PER_TITLE} attempt.")
             submit_result(job_id=job_id, status="failed")
 
-    print(f"[T{worker_id}] Selesai. Local selesai: {local_done}")
-
-
-# ============================
-# MAIN: START 5 THREAD
-# ============================
-def main():
-    threads = []
-    for idx, key in enumerate(api_keys_for_job):
-        t = threading.Thread(
-            target=worker_thread,
-            args=(idx + 1, key),
-            daemon=True
-        )
-        t.start()
-        threads.append(t)
-
-    for t in threads:
-        t.join()
-
-    print(f"\n🎉 GROUP_INDEX={GROUP_INDEX} selesai. Total artikel global: {global_article_counter}")
+    print(f"\n🎉 Worker index {WORKER_INDEX} selesai. Total artikel sukses: {total_sukses}")
 
 
 if __name__ == "__main__":
     main()
-
-
-# Misal kamu punya 20 key di api.txt.
-# Kita bikin 4 job parallel, masing-masing ambil 5 key:
-
-# GROUP_INDEX 0 → key 0–4
-
-# GROUP_INDEX 1 → key 5–9
-
-# GROUP_INDEX 2 → key 10–14
-
-# GROUP_INDEX 3 → key 15–19
