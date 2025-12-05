@@ -1,0 +1,36 @@
+name: Gemini Workers
+
+on:
+  workflow_dispatch: {}   # manual start
+  # schedule:
+  #   - cron: "0 * * * *"  # kalau mau jalan tiap jam
+
+jobs:
+  gemini_worker:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        WORKER_INDEX: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+                       10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+
+    env:
+      WORKER_INDEX: ${{ matrix.WORKER_INDEX }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-genai requests
+
+      - name: Jalankan worker Gemini
+        run: |
+          python worker_gemini.py
